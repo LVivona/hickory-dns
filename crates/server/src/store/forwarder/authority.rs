@@ -6,15 +6,18 @@
 // copied, modified, or distributed except according to those terms.
 
 use std::io;
+#[cfg(feature = "__dnssec")]
+use std::sync::Arc;
 
+use cfg_if::cfg_if;
 use hickory_resolver::{
-    config::ResolveHosts,
+    config::{ResolveHosts, ResolverOpts},
     name_server::{ConnectionProvider, TokioConnectionProvider},
 };
 use tracing::{debug, info};
 
 #[cfg(feature = "__dnssec")]
-use crate::{authority::Nsec3QueryInfo, dnssec::NxProofKind};
+use crate::{authority::Nsec3QueryInfo, dnssec::NxProofKind, proto::dnssec::TrustAnchor};
 use crate::{
     authority::{
         Authority, LookupControlFlow, LookupError, LookupObject, LookupOptions, MessageRequest,
@@ -52,8 +55,40 @@ impl<P: ConnectionProvider> ForwardAuthority<P> {
     /// Read the Authority for the origin from the specified configuration
     pub fn try_from_runtime(
         origin: Name,
+        zone_type: ZoneType,
+        config: &ForwardConfig,
+        runtime: P,
+    ) -> Result<Self, String> {
+        cfg_if! {
+            if #[cfg(feature = "__dnssec")] {
+                Self::with_trust_anchor(origin,zone_type,config,Arc::new(TrustAnchor::default()),runtime)
+            } else {
+                let resolver_constructor = |config, options, runtime| Resolver::new(config, options, runtime);
+                Self::new_inner(origin, zone_type, config, resolver_constructor, runtime)
+            }
+        }
+    }
+
+    /// Construct the Authority from the specified configuration and a set of DNSSEC trust anchors.
+    #[cfg(feature = "__dnssec")]
+    pub fn with_trust_anchor(
+        origin: Name,
+        zone_type: ZoneType,
+        config: &ForwardConfig,
+        trust_anchor: Arc<TrustAnchor>,
+        runtime: P,
+    ) -> Result<Self, String> {
+        let resolver_constructor = |config, options, runtime: P| {
+            Resolver::with_trust_anchor(config, options, trust_anchor, runtime)
+        };
+        Self::new_inner(origin, zone_type, config, resolver_constructor, runtime)
+    }
+
+    fn new_inner(
+        origin: Name,
         _zone_type: ZoneType,
         config: &ForwardConfig,
+        resolver_constructor: impl FnOnce(ResolverConfig, ResolverOpts, P) -> Resolver<P>,
         runtime: P,
     ) -> Result<Self, String> {
         info!("loading forwarder config: {}", origin);
@@ -88,7 +123,7 @@ impl<P: ConnectionProvider> ForwardAuthority<P> {
 
         let config = ResolverConfig::from_parts(None, vec![], name_servers);
 
-        let resolver = Resolver::new(config, options, runtime);
+        let resolver = resolver_constructor(config, options, runtime);
 
         info!("forward resolver configured: {}: ", origin);
 

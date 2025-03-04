@@ -13,6 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use cfg_if::cfg_if;
 use futures_util::{FutureExt, future};
 use tracing::{debug, trace};
 
@@ -26,6 +27,8 @@ use crate::lookup_ip::{LookupIp, LookupIpFuture};
 #[cfg(feature = "tokio")]
 use crate::name_server::TokioConnectionProvider;
 use crate::name_server::{ConnectionProvider, NameServerPool};
+#[cfg(feature = "__dnssec")]
+use crate::proto::dnssec::{DnssecDnsHandle, TrustAnchor};
 use crate::proto::op::Query;
 use crate::proto::rr::domain::usage::ONION;
 use crate::proto::rr::{IntoName, Name, RData, Record, RecordType};
@@ -122,25 +125,54 @@ impl<R: ConnectionProvider> Resolver<R> {
     /// * `options` - basic lookup options for the resolver
     /// * `provider` - connection provider, for DNS connections, I/O, and timers
     pub fn new(config: ResolverConfig, options: ResolverOpts, provider: R) -> Self {
-        let pool = NameServerPool::from_config_with_provider(&config, options.clone(), provider);
-        let either;
-        let client = RetryDnsHandle::new(pool, options.attempts);
-        if options.validate {
-            #[cfg(feature = "__dnssec")]
-            {
-                use crate::proto::dnssec::DnssecDnsHandle;
-                either = LookupEither::Secure(DnssecDnsHandle::new(client));
+        cfg_if! {
+            if #[cfg(feature = "__dnssec")] {
+                Self::with_trust_anchor(config, options, Arc::new(TrustAnchor::default()), provider)
+            } else {
+                let client_constructor =|client: RetryDnsHandle<NameServerPool<R>>, _options: &ResolverOpts| LookupEither::Retry(client);
+                Self::new_inner(config, options, client_constructor, provider)
             }
-
-            #[cfg(not(feature = "__dnssec"))]
-            {
-                // TODO: should this just be a panic, or a pinned error?
-                tracing::warn!("validate option is only available with 'dnssec' feature");
-                either = LookupEither::Retry(client);
-            }
-        } else {
-            either = LookupEither::Retry(client);
         }
+    }
+
+    /// Construct a new generic `Resolver` with the provided configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - configuration, name_servers, etc. for the Resolver
+    /// * `options` - basic lookup options for the resolver
+    /// * `trust_anchor` - DNSSEC trust anchors
+    /// * `provider` - connection provider, for DNS connections, I/O, and timers
+    #[cfg(feature = "__dnssec")]
+    pub fn with_trust_anchor(
+        config: ResolverConfig,
+        options: ResolverOpts,
+        trust_anchor: Arc<TrustAnchor>,
+        provider: R,
+    ) -> Self {
+        let client_constructor = |client: RetryDnsHandle<NameServerPool<R>>,
+                                  options: &ResolverOpts| {
+            if options.validate {
+                LookupEither::Secure(DnssecDnsHandle::with_trust_anchor(client, trust_anchor))
+            } else {
+                LookupEither::Retry(client)
+            }
+        };
+        Self::new_inner(config, options, client_constructor, provider)
+    }
+
+    fn new_inner(
+        config: ResolverConfig,
+        options: ResolverOpts,
+        client_constructor: impl FnOnce(
+            RetryDnsHandle<NameServerPool<R>>,
+            &ResolverOpts,
+        ) -> LookupEither<R>,
+        provider: R,
+    ) -> Self {
+        let pool = NameServerPool::from_config_with_provider(&config, options.clone(), provider);
+        let client = RetryDnsHandle::new(pool, options.attempts);
+        let either = client_constructor(client, &options);
 
         let hosts = match options.use_hosts_file {
             ResolveHosts::Always | ResolveHosts::Auto => Some(Arc::new(Hosts::new())),
